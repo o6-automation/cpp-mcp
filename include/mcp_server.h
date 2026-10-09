@@ -221,6 +221,13 @@ public:
         /** Inactive session timeout in seconds (0 = disabled) */
         unsigned int session_timeout{ MCP_SESSION_TIMEOUT };
 
+        /** Origins permitted to access HTTP endpoints from a browser. Empty denies
+         * all requests that carry an Origin header. Non-browser clients may omit it. */
+        std::vector<std::string> allowed_origins{};
+
+        /** Maximum HTTP request body size in bytes. */
+        size_t max_request_bytes{ 1024 * 1024 };
+
         #ifdef MCP_SSL        
         /**
          * @brief SSL configuration settings.
@@ -363,9 +370,8 @@ public:
     
     /**
      * @brief Set authentication handler
-     * @param handler Function that takes a token and returns true if valid
-     * @note The handler should return true if the token is valid, otherwise false
-     * @note Not used in the current implementation
+     * @param handler Function receiving a Bearer token and remote address.
+     * Requests are rejected with HTTP 401 when it returns false.
      */
     void set_auth_handler(auth_handler handler);
 
@@ -458,6 +464,9 @@ private:
     
     // Authentication handler
     auth_handler auth_handler_;
+
+    std::vector<std::string> allowed_origins_;
+    size_t max_request_bytes_;
     
     // Mutex for thread safety
     mutable std::mutex mutex_;

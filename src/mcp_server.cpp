@@ -7,6 +7,7 @@
  */
 
 #include "mcp_server.h"
+#include <algorithm>
 #include <sys/stat.h>
 
 namespace {
@@ -27,9 +28,11 @@ server::server(const server::configuration& conf)
     , sse_endpoint_(conf.sse_endpoint)
     , msg_endpoint_(conf.msg_endpoint)
     , mcp_endpoint_(conf.mcp_endpoint)
-    , thread_pool_(conf.threadpool_size)
+    , allowed_origins_(conf.allowed_origins)
+    , max_request_bytes_(conf.max_request_bytes)
     , max_sessions_(conf.max_sessions)
     , session_timeout_(conf.session_timeout)
+    , thread_pool_(conf.threadpool_size)
 {
     #ifdef MCP_SSL
     if (conf.ssl.server_cert_path && conf.ssl.server_private_key_path) {
@@ -49,6 +52,7 @@ server::server(const server::configuration& conf)
     #else
      http_server_ = std::make_unique<httplib::Server>();
     #endif
+    http_server_->set_payload_max_length(max_request_bytes_);
 }
 
 server::~server() {
@@ -124,11 +128,41 @@ bool server::start(bool blocking) {
     
     LOG_INFO("Starting MCP server on ", host_, ":", port_);
     
-    // Setup CORS handling
+    // Run the security policy before routing, including on legacy endpoints.
+    http_server_->set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (req.has_header("Origin")) {
+            const std::string origin = req.get_header_value("Origin");
+            if (std::find(allowed_origins_.begin(), allowed_origins_.end(), origin) == allowed_origins_.end()) {
+                res.status = 403;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            res.set_header("Access-Control-Allow-Origin", origin);
+            res.set_header("Vary", "Origin");
+        }
+        auth_handler auth;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auth = auth_handler_;
+        }
+        if (auth && req.method != "OPTIONS") {
+            const std::string authorization = req.get_header_value("Authorization");
+            constexpr const char* bearer = "Bearer ";
+            if (authorization.compare(0, 7, bearer) != 0 ||
+                authorization.size() == 7 || !auth(authorization.substr(7), req.remote_addr)) {
+                res.status = 401;
+                res.set_header("WWW-Authenticate", "Bearer");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     http_server_->Options(".*", [](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
+        const std::string requested = req.get_header_value("Access-Control-Request-Headers");
+        res.set_header("Access-Control-Allow-Headers", requested.empty()
+            ? "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name"
+            : requested);
         res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
         res.status = 204; // No Content
     });
@@ -697,7 +731,6 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
-    res.set_header("Access-Control-Allow-Origin", "*");
 
     // Create session-specific event dispatcher
     auto session_dispatcher = std::make_shared<event_dispatcher>();
@@ -839,7 +872,6 @@ void server::handle_sse(const httplib::Request& req, httplib::Response& res) {
 void server::handle_jsonrpc(const httplib::Request& req, httplib::Response& res) {
     // Setup response headers
     res.set_header("Content-Type", "application/json");
-    res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
     
@@ -972,7 +1004,6 @@ request server::parse_jsonrpc_message(const json& j) const {
 
 void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res) {
     // CORS headers
-    res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
@@ -1145,7 +1176,6 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
     // CORS headers
-    res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("MCP-Protocol-Version", MCP_VERSION);
@@ -1223,7 +1253,6 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
 }
 
 void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("MCP-Protocol-Version", MCP_VERSION);
