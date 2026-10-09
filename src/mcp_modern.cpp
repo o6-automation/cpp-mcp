@@ -2,7 +2,6 @@
 #include "base64.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <optional>
 
 namespace {
@@ -15,8 +14,8 @@ json protocol_error(const json& id, mcp::error_code code,
 }
 
 bool plain_header_value(const std::string& value) {
-    if (value.empty() || value.front() == ' ' || value.back() == ' ' ||
-        value.front() == '\t' || value.back() == '\t') {
+    if (!value.empty() && (value.front() == ' ' || value.back() == ' ' ||
+        value.front() == '\t' || value.back() == '\t')) {
         return false;
     }
     return std::all_of(value.begin(), value.end(), [](unsigned char c) {
@@ -38,7 +37,7 @@ std::optional<std::string> decode_mirrored_value(const std::string& value) {
                 return std::nullopt;
             }
             return decoded;
-        } catch (const base64_error&) {
+        } catch (const std::exception&) {
             return std::nullopt;
         }
     }
@@ -52,7 +51,8 @@ bool valid_header_token(const std::string& token) {
     if (token.empty()) return false;
     static const std::string punctuation = "!#$%&'*+-.^_`|~";
     return std::all_of(token.begin(), token.end(), [&](unsigned char c) {
-        return std::isalnum(c) || punctuation.find(static_cast<char>(c)) != std::string::npos;
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') || punctuation.find(static_cast<char>(c)) != std::string::npos;
     });
 }
 
@@ -248,6 +248,15 @@ json server::process_modern_request(const request& req, int& http_status) {
         if (req.method == "server/discover") {
             std::lock_guard<std::mutex> lock(mutex_);
             json caps = capabilities_.is_object() ? capabilities_ : json::object();
+            // Session-era push notifications and logging are not exposed by
+            // this stateless transport. Do not advertise a stream we cannot serve.
+            caps.erase("logging");
+            for (const char* feature : {"tools", "prompts", "resources"}) {
+                if (caps.contains(feature) && caps[feature].is_object())
+                    caps[feature].erase("listChanged");
+            }
+            if (caps.contains("resources") && caps["resources"].is_object())
+                caps["resources"].erase("subscribe");
             if (!tools_.empty() && !caps.contains("tools")) caps["tools"] = json::object();
             if ((!resources_.empty() || !resource_templates_.empty()) && !caps.contains("resources"))
                 caps["resources"] = json::object();
@@ -259,9 +268,14 @@ json server::process_modern_request(const request& req, int& http_status) {
                 {"cacheScope", "private"}
             };
             if (!instructions_.empty()) result["instructions"] = instructions_;
-        } else if (req.method == "ping") {
-            result = json::object();
         } else {
+            if (req.method == "initialize" || req.method == "ping" ||
+                req.method == "logging/setLevel" || req.method == "resources/subscribe" ||
+                req.method == "resources/unsubscribe") {
+                http_status = 404;
+                return protocol_error(req.id, error_code::method_not_found,
+                                      "Method not found: " + req.method);
+            }
             method_handler handler;
             {
                 std::lock_guard<std::mutex> lock(mutex_);

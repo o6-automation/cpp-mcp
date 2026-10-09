@@ -1,6 +1,6 @@
 # MCP Protocol Framework
 
-[Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/specification/2024-11-05/architecture/) is an open protocol that provides a standardized way for AI models and agents to interact with various resources, tools, and services. This framework implements the core functionality of the MCP protocol, conforming to the 2025-03-26 basic protocol specification.
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2026-07-28/basic/index) is an open protocol that provides a standardized way for AI models and agents to interact with resources, tools, and services. The server accepts stateless 2026-07-28 requests as well as the earlier 2025-03-26 session lifecycle. The bundled C++ client classes still use the earlier lifecycle.
 
 ## Core Features
 
@@ -20,20 +20,52 @@ cmake --build build --config Release
 ```
 
 Build with tests:
-```
-git submodule update --init --recursive # Get GoogleTest
-
+```bash
 cmake -B build -DMCP_BUILD_TESTS=ON
 cmake --build build --config Release
+ctest --test-dir build --output-on-failure
 ```
+
+The modern HTTP wire tests run without GoogleTest. Initialize the `test/googletest` submodule to build the older unit suite too.
 
 Build with SSL support:
-```
-git submodule update --init --recursive # Get GoogleTest
-
+```bash
 cmake -B build -DMCP_SSL=ON
 cmake --build build --config Release
 ```
+
+## Server protocol revisions
+
+The HTTP server uses one `/mcp` endpoint for both supported revisions. Requests with `MCP-Protocol-Version: 2026-07-28` and matching per-request `_meta` use the stateless lifecycle. They do not initialize or receive an `Mcp-Session-Id`. `server/discover` advertises both supported versions. Requests from 2025-03-26 clients continue to use initialize, a session ID, and the legacy GET/DELETE stream behavior.
+
+For example, a modern discovery request is:
+
+```http
+POST /mcp HTTP/1.1
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: server/discover
+
+{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+```
+
+Modern `tools/call`, `resources/read`, and `prompts/get` requests also need `Mcp-Name` matching the body name or URI. Tool parameters annotated with `x-mcp-header` need matching `Mcp-Param-*` headers. Result objects include `resultType` and server identity in `_meta`.
+
+The server validates `Origin` on every HTTP route. Browser origins are denied by default; list exact approved origins in `configuration.allowed_origins`. An optional `set_auth_handler` callback validates bearer tokens on requests. `configuration.max_request_bytes` defaults to 1 MiB. These settings also protect the legacy routes. Bind to loopback unless remote access is deliberately configured; use TLS and authentication for remote access.
+
+```cpp
+mcp::server::configuration conf;
+conf.host = "127.0.0.1";
+conf.allowed_origins = {"http://localhost:3000"};
+conf.max_request_bytes = 1024 * 1024;
+mcp::server server(conf);
+server.set_auth_handler([](const std::string& token, const std::string& remote_address) {
+    return token == "configure-a-secret-token";
+});
+```
+
+The 2026 server path currently supports request/response methods and passes through handler-provided `input_required` results. It does not implement `subscriptions/listen`, request-scoped SSE streaming, or a modern C++ client. Discovery does not advertise legacy list-change subscriptions on the modern path. These optional features need separate implementation before an application enables them.
 
 ## Adopters
 
@@ -305,4 +337,3 @@ srv_conf.ssl.server_private_key_path = "./server.key.pem";
 ## License
 
 This framework is provided under the MIT license. For details, please see the LICENSE file.
-

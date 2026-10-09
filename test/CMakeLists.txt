@@ -11,8 +11,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find required packages
 find_package(Threads REQUIRED)
 
-# Use local Google Test
+# A small wire-level suite is runnable without fetching the optional submodule.
+add_executable(mcp_modern_http_test modern_http_test.cpp)
+target_link_libraries(mcp_modern_http_test PRIVATE mcp)
+add_test(NAME mcp_modern_http_test COMMAND mcp_modern_http_test)
+
+# Use local Google Test when its submodule is available.
 set(GTEST_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/googletest)
+if(EXISTS ${GTEST_ROOT}/CMakeLists.txt)
 add_subdirectory(${GTEST_ROOT} googletest-build)
 
 # For older versions of CMake, this option needs to be set
@@ -74,4 +80,5 @@ add_test(
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --verbose
     DEPENDS ${TEST_PROJECT_NAME}
-) 
+)
+endif()
