@@ -26,6 +26,7 @@ using json = nlohmann::ordered_json;
 
 // MCP version
 constexpr const char* MCP_VERSION = "2025-03-26";
+constexpr const char* MCP_MODERN_VERSION = "2026-07-28";
 
 // MCP error codes (JSON-RPC 2.0 standard codes)
 enum class error_code {
@@ -34,6 +35,9 @@ enum class error_code {
     method_not_found = -32601,      // Method not found
     invalid_params = -32602,        // Invalid method parameters
     internal_error = -32603,        // Internal JSON-RPC error
+    header_mismatch = -32020,       // Mirrored HTTP header differs from body
+    missing_client_capability = -32021,
+    unsupported_protocol_version = -32022,
     server_error_start = -32000,    // Server error start
     server_error_end = -32099       // Server error end
 };

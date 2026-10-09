@@ -491,10 +491,12 @@ private:
     void handle_sse(const httplib::Request& req, httplib::Response& res);
     void handle_jsonrpc(const httplib::Request& req, httplib::Response& res);
 
-    // Streamable HTTP transport (2025-03-26)
+    // Streamable HTTP transport (2025-03-26 and 2026-07-28)
     void handle_mcp_post(const httplib::Request& req, httplib::Response& res);
     void handle_mcp_get(const httplib::Request& req, httplib::Response& res);
     void handle_mcp_delete(const httplib::Request& req, httplib::Response& res);
+    void handle_modern_post(const httplib::Request& req, httplib::Response& res, const json& body);
+    json process_modern_request(const request& req, int& http_status);
 
     // Parse a single JSON-RPC message from JSON
     request parse_jsonrpc_message(const json& j) const;

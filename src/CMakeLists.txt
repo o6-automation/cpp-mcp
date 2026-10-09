@@ -7,6 +7,7 @@ add_library(${TARGET} STATIC
     mcp_resource.cpp
     ../include/mcp_resource.h
     mcp_server.cpp
+    mcp_modern.cpp
     ../include/mcp_server.h
     mcp_tool.cpp
     ../include/mcp_tool.h

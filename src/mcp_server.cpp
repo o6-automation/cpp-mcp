@@ -82,7 +82,16 @@ void server::start_stdio() {
                     req.params = req_json["params"];
                 }
                 
-                json res = process_request(req, session_id);
+                const bool modern = req.method == "server/discover" ||
+                    (req.params.is_object() && req.params.contains("_meta") &&
+                     req.params["_meta"].is_object() &&
+                     req.params["_meta"].contains("io.modelcontextprotocol/protocolVersion"));
+                if (modern && req.is_notification()) {
+                    continue;
+                }
+                int ignored_http_status = 200;
+                json res = modern ? process_modern_request(req, ignored_http_status)
+                                  : process_request(req, session_id);
                 if (!res.is_null() && !req.id.is_null()) {
                     std::cout << res.dump() << "\n" << std::flush;
                 } else {
@@ -1007,7 +1016,6 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
     res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
-    res.set_header("MCP-Protocol-Version", MCP_VERSION);
 
     // Parse JSON body
     json body;
@@ -1021,6 +1029,20 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             "application/json");
         return;
     }
+
+    // The 2026 revision is selected by its per-request metadata or mirrored
+    // routing headers. Legacy initialize/session traffic keeps its old path.
+    const bool has_modern_meta = body.is_object() && body.contains("params") &&
+        body["params"].is_object() && body["params"].contains("_meta") &&
+        body["params"]["_meta"].is_object() &&
+        body["params"]["_meta"].contains("io.modelcontextprotocol/protocolVersion");
+    const std::string protocol_header = req.get_header_value("MCP-Protocol-Version");
+    if (has_modern_meta || req.has_header("Mcp-Method") ||
+        (!protocol_header.empty() && protocol_header != MCP_VERSION)) {
+        handle_modern_post(req, res, body);
+        return;
+    }
+    res.set_header("MCP-Protocol-Version", MCP_VERSION);
 
     // Get or create session
     std::string session_id = req.get_header_value("Mcp-Session-Id");
@@ -1175,6 +1197,11 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
 }
 
 void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res) {
+    if (req.get_header_value("MCP-Protocol-Version") == MCP_MODERN_VERSION) {
+        res.status = 405;
+        res.set_header("Allow", "POST");
+        return;
+    }
     // CORS headers
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
@@ -1253,6 +1280,11 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
 }
 
 void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& res) {
+    if (req.get_header_value("MCP-Protocol-Version") == MCP_MODERN_VERSION) {
+        res.status = 405;
+        res.set_header("Allow", "POST");
+        return;
+    }
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("MCP-Protocol-Version", MCP_VERSION);
