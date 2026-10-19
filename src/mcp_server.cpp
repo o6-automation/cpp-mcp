@@ -635,7 +635,7 @@ void server::register_tool(const tool& tool, tool_handler handler) {
                 throw mcp_exception(error_code::invalid_params, "Tool not found: " + tool_name);
             }
             
-            json tool_args = params.contains("arguments") ? params["arguments"] : json::array();
+            json tool_args = params.contains("arguments") ? params["arguments"] : json::object();
 
             if (tool_args.is_string()) {
                 try {
@@ -650,7 +650,15 @@ void server::register_tool(const tool& tool, tool_handler handler) {
             };
 
             try {
-                tool_result["content"] = it->second.second(tool_args, session_id);
+                auto result = it->second.second(tool_args, session_id);
+                // Existing handlers return a content array. New handlers may
+                // return a complete CallToolResult, including structured data.
+                if (result.is_object() && result.contains("content") &&
+                    result["content"].is_array()) {
+                    tool_result.update(result);
+                } else {
+                    tool_result["content"] = std::move(result);
+                }
             } catch (const std::exception& e) {
                 tool_result["isError"] = true;
                 tool_result["content"] = json::array({

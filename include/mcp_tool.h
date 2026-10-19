@@ -25,6 +25,7 @@ struct tool {
     std::string description;
     json parameters_schema;
     json annotations;  // Optional tool annotations (2025-03-26 spec)
+    json output_schema; // Optional schema for structured tool results
 
     // Convert to JSON for API documentation
     json to_json() const {
@@ -36,6 +37,7 @@ struct tool {
         if (!annotations.is_null() && !annotations.empty()) {
             j["annotations"] = annotations;
         }
+        if (!output_schema.is_null()) j["outputSchema"] = output_schema;
         return j;
     }
 };
