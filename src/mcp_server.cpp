@@ -53,6 +53,7 @@ server::server(const server::configuration& conf)
      http_server_ = std::make_unique<httplib::Server>();
     #endif
     http_server_->set_payload_max_length(max_request_bytes_);
+    http_server_->new_task_queue = [] { return new httplib::ThreadPool(16); };
 }
 
 server::~server() {
@@ -345,6 +346,8 @@ void server::stop() {
         }
         session_dispatchers_.clear();
         session_initialized_.clear();
+        push_streams_.clear();
+        push_cv_.notify_all();
 
         threads_to_join.reserve(sse_threads_.size());
         for (auto& [_, thread] : sse_threads_) {
@@ -1038,11 +1041,11 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
         body["params"]["_meta"].contains("io.modelcontextprotocol/protocolVersion");
     const std::string protocol_header = req.get_header_value("MCP-Protocol-Version");
     if (has_modern_meta || req.has_header("Mcp-Method") ||
-        (!protocol_header.empty() && protocol_header != MCP_VERSION)) {
+        (!protocol_header.empty() && protocol_header != MCP_VERSION && protocol_header != "2025-11-25")) {
         handle_modern_post(req, res, body);
         return;
     }
-    res.set_header("MCP-Protocol-Version", MCP_VERSION);
+    res.set_header("MCP-Protocol-Version", req.get_header_value("MCP-Protocol-Version") == "2025-11-25" ? "2025-11-25" : MCP_VERSION);
 
     // Get or create session
     std::string session_id = req.get_header_value("Mcp-Session-Id");
@@ -1072,12 +1075,16 @@ void server::handle_mcp_post(const httplib::Request& req, httplib::Response& res
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        if (session_dispatchers_.find(session_id) == session_dispatchers_.end()) {
+        auto session = session_dispatchers_.find(session_id);
+        if (session == session_dispatchers_.end()) {
             // Session expired or invalid — client must re-initialize
             res.status = 404;
             res.set_content("{\"error\":\"Session not found\"}", "application/json");
             return;
         }
+        // Resource polling and ordinary tool calls keep a stateful session
+        // alive even when the client does not maintain a GET/SSE stream.
+        session->second->update_activity();
     }
 
     // Handle batched requests
@@ -1205,7 +1212,7 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
     // CORS headers
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
-    res.set_header("MCP-Protocol-Version", MCP_VERSION);
+    res.set_header("MCP-Protocol-Version", req.get_header_value("MCP-Protocol-Version") == "2025-11-25" ? "2025-11-25" : MCP_VERSION);
 
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
@@ -1234,48 +1241,63 @@ void server::handle_mcp_get(const httplib::Request& req, httplib::Response& res)
         return;
     }
 
-    // Open SSE stream for server-initiated notifications
-    res.set_header("Content-Type", "text/event-stream");
-    res.set_header("Cache-Control", "no-cache");
-    res.set_header("Connection", "keep-alive");
-
-    auto sent_initial = std::make_shared<std::atomic<bool>>(false);
-
-    // Use chunked content provider — same pattern as legacy SSE
-    res.set_chunked_content_provider(
-        "text/event-stream",
-        [this, session_id, dispatcher, sent_initial](size_t, httplib::DataSink& sink) {
+    auto cursor = std::make_shared<uint64_t>(0);
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& stream = push_streams_[session_id];
+        const auto last = req.get_header_value("Last-Event-ID");
+        if(!last.empty()) {
+            const auto prefix = session_id + ":";
+            if(last.compare(0, prefix.size(), prefix) != 0) { res.status = 400; return; }
             try {
-                if (dispatcher->is_closed() || !running_) {
-                    return false;
+                size_t used = 0;
+                const auto digits = last.substr(prefix.size());
+                *cursor = std::stoull(digits, &used);
+                if(used != digits.size() || *cursor > stream.next) { res.status = 400; return; }
+            } catch(...) { res.status = 400; return; }
+        }
+        if(!stream.records.empty() && *cursor < stream.records.front().id - 1)
+            *cursor = stream.records.front().id - 1;
+        generation = ++stream.generation;
+        stream.active = true;
+        push_cv_.notify_all();
+    }
+    res.set_header("Cache-Control", "no-cache");
+    res.set_chunked_content_provider("text/event-stream",
+        [this, session_id, dispatcher, cursor, generation](size_t, httplib::DataSink& sink) {
+            std::string body;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                auto valid = [&] {
+                    auto it = push_streams_.find(session_id);
+                    return running_ && it != push_streams_.end() && it->second.generation == generation;
+                };
+                push_cv_.wait_for(lock, std::chrono::seconds(2), [&] {
+                    return !valid() || push_streams_.at(session_id).next > *cursor;
+                });
+                if(!valid()) return false;
+                auto& stream = push_streams_.at(session_id);
+                // One frame is written at a time; replay storage is the bounded queue.
+                // A slow stream overtaken by eviction reconnects and reads the resource log.
+                if(!stream.records.empty() && *cursor < stream.records.front().id - 1) {
+                    stream.active = false; return false;
                 }
-
-                if (!sent_initial->exchange(true, std::memory_order_acq_rel)) {
-                    static constexpr const char* kInitialComment = ": connected\r\n\r\n";
-                    if (!sink.write(kInitialComment, sizeof(": connected\r\n\r\n") - 1)) {
-                        return false;
-                    }
+                for(const auto& r : stream.records) if(r.id > *cursor) {
+                    body = "id: " + session_id + ":" + std::to_string(r.id) +
+                        "\r\nevent: message\r\ndata: " + r.body + "\r\n\r\n";
+                    *cursor = r.id;
+                    break;
                 }
-
-                dispatcher->update_activity();
-                bool result = dispatcher->wait_event(&sink);
-                if (!result) {
-                    if (dispatcher->is_closed() || !running_) {
-                        return false;
-                    }
-
-                    static constexpr const char* kHeartbeatComment = ": heartbeat\r\n\r\n";
-                    if (!sink.write(kHeartbeatComment, sizeof(": heartbeat\r\n\r\n") - 1)) {
-                        return false;
-                    }
-                    dispatcher->update_activity();
-                    return true;
-                }
-                dispatcher->update_activity();
-                return true;
-            } catch (...) {
-                return false;
+                if(body.empty()) { *cursor = stream.next; body = ": heartbeat\r\n\r\n"; }
             }
+            dispatcher->update_activity();
+            return sink.write(body.data(), body.size());
+        }, [this, session_id, generation](bool) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = push_streams_.find(session_id);
+            if(it != push_streams_.end() && it->second.generation == generation)
+                it->second.active = false;
         });
 }
 
@@ -1287,7 +1309,7 @@ void server::handle_mcp_delete(const httplib::Request& req, httplib::Response& r
     }
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version");
     res.set_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version");
-    res.set_header("MCP-Protocol-Version", MCP_VERSION);
+    res.set_header("MCP-Protocol-Version", req.get_header_value("MCP-Protocol-Version") == "2025-11-25" ? "2025-11-25" : MCP_VERSION);
 
     std::string session_id = req.get_header_value("Mcp-Session-Id");
     if (session_id.empty()) {
@@ -1408,12 +1430,17 @@ json server::handle_initialize(const request& req, const std::string& session_id
 
     // Per 2025-03-26 spec: if client requests a version we don't support,
     // respond with the latest version we DO support and let the client decide.
-    std::string negotiated_version = MCP_VERSION;
+    std::string negotiated_version = requested_version == "2025-11-25" ? requested_version : MCP_VERSION;
     if (requested_version != MCP_VERSION) {
         LOG_WARNING("Client requested version ", requested_version,
                     ", server supports ", MCP_VERSION, ". Responding with server version.");
     }
 
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(session_dispatchers_.count(session_id))
+            push_streams_[session_id].capabilities = params.value("capabilities", json::object());
+    }
     // Extract client info
     std::string client_name = "UnknownClient";
     std::string client_version = "UnknownVersion";
@@ -1452,37 +1479,60 @@ json server::handle_initialize(const request& req, const std::string& session_id
 }
 
 void server::send_jsonrpc(const std::string& session_id, const json& message) {
-    // Check if session ID is valid
-    if (session_id.empty()) {
-        LOG_WARNING("Cannot send message to empty session_id");
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(!session_dispatchers_.count(session_id)) return;
+    if(sse_threads_.count(session_id)) {
+        session_dispatchers_.at(session_id)->send_event("event: message\r\ndata: " + message.dump() + "\r\n\r\n");
         return;
     }
+    auto& stream = push_streams_[session_id];
+    const auto body = message.dump();
+    std::string uri;
+    if(message.value("method", "") == "notifications/resources/updated")
+        uri = message.at("params").value("uri", "");
+    stream.records.push_back({++stream.next, uri, body});
+    stream.bytes += body.size();
+    trim_push_streams();
+    push_cv_.notify_all();
+}
 
-    // Get session dispatcher
-    std::shared_ptr<event_dispatcher> dispatcher;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = session_dispatchers_.find(session_id);
-        if (it == session_dispatchers_.end()) {
-            LOG_ERROR("Session not found: ", session_id);
-            return;
+void server::trim_push_streams() {
+    size_t total = 0;
+    for(auto& entry : push_streams_) {
+        auto& s = entry.second;
+        while(s.records.size() > 4096 || s.bytes > 8 * 1024 * 1024) {
+            s.bytes -= s.records.front().body.size(); s.records.pop_front();
         }
-        dispatcher = it->second;
+        total += s.bytes;
     }
-    
-    // Confirm dispatcher is still valid
-    if (!dispatcher || dispatcher->is_closed()) {
-        LOG_WARNING("Cannot send to closed session: ", session_id);
-        return;
+    // Each listener is capped at 8 MiB; the application's two listeners total 16 MiB.
+    while(total > 8 * 1024 * 1024) {
+        auto largest = std::max_element(push_streams_.begin(), push_streams_.end(),
+            [](const auto& a, const auto& b) { return a.second.bytes < b.second.bytes; });
+        auto& s = largest->second;
+        const auto bytes = s.records.front().body.size();
+        s.records.pop_front(); s.bytes -= bytes; total -= bytes;
     }
-    
-    // Send message
-    std::stringstream ss;
-    ss << "event: message\r\ndata: " << message.dump() << "\r\n\r\n";
-    bool result = dispatcher->send_event(ss.str());
-    
-    if (!result) {
-        LOG_ERROR("Failed to send message to session: ", session_id);
+}
+json server::client_capabilities(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = push_streams_.find(id);
+    if(it == push_streams_.end()) throw std::runtime_error("Monitoring requires a stateful MCP session");
+    return it->second.capabilities;
+}
+bool server::notification_stream_active(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = push_streams_.find(id);
+    return it != push_streams_.end() && it->second.active;
+}
+void server::clear_resource_notifications(const std::string& id, const std::string& uri) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = push_streams_.find(id);
+    if(it == push_streams_.end()) return;
+    auto& s = it->second;
+    for(auto r = s.records.begin(); r != s.records.end();) {
+        if(r->uri == uri) { s.bytes -= r->body.size(); r = s.records.erase(r); }
+        else ++r;
     }
 }
 
@@ -1635,7 +1685,7 @@ void server::invoke_session_cleanup(
             continue;
         }
         try {
-            handler(key);
+            handler(session_id);
         } catch (const std::exception& e) {
             LOG_WARNING("Exception in session cleanup handler for ", session_id, ": ", e.what());
         } catch (...) {
@@ -1687,6 +1737,8 @@ void server::close_session(const std::string& session_id) {
             }
 
             session_initialized_.erase(session_id);
+            push_streams_.erase(session_id);
+            push_cv_.notify_all();
         }
 
         if (dispatcher_to_close) {

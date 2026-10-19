@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <deque>
 #include <thread>
 #include <functional>
 #include <chrono>
@@ -358,7 +359,7 @@ public:
     /**
      * @brief Register a session cleanup handler
      * @param key Tool or resource name to be cleaned up
-     * @param handler The function to call when the session is closed
+     * @param handler Called with the closed session ID (not the registration key)
      */
     void register_session_cleanup(const std::string& key, session_cleanup_handler handler);
     
@@ -381,6 +382,9 @@ public:
      * @param req The request to send
      */
     void send_request(const std::string& session_id, const request& req);
+    json client_capabilities(const std::string& session_id) const;
+    bool notification_stream_active(const std::string& session_id) const;
+    void clear_resource_notifications(const std::string& session_id, const std::string& uri);
 
     /**
      * @brief Broadcast a notification to all connected, initialized sessions
@@ -486,6 +490,17 @@ private:
     
     // Map to track session initialization status (session_id -> initialized)
     std::map<std::string, bool> session_initialized_;
+    struct stream_record { uint64_t id; std::string uri, body; };
+    struct push_stream {
+        std::deque<stream_record> records;
+        size_t bytes = 0;
+        uint64_t next = 0, generation = 0;
+        bool active = false;
+        json capabilities = json::object();
+    };
+    std::map<std::string, push_stream> push_streams_;
+    std::condition_variable push_cv_;
+    void trim_push_streams();
 
     // Legacy HTTP+SSE transport (2024-11-05)
     void handle_sse(const httplib::Request& req, httplib::Response& res);

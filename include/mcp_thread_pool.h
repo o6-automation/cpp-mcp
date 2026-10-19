@@ -114,7 +114,6 @@ private:
     }
 
     void worker_loop() {
-        bool is_shrinking = false;
         while (true) {
             std::function<void()> task;
             
@@ -131,17 +130,18 @@ private:
                 idle_threads_--;
                 
                 // Exit condition 1: Destructor called and queue is empty
+                // Return under this final lock: after publishing zero workers,
+                // never reacquire the mutex or touch the pool again.
                 if (stop_ && tasks_.empty()) {
-                    is_shrinking = true;
                     active_threads_--;
-                    break;
+                    if (active_threads_ == 0) shutdown_cv_.notify_all();
+                    return;
                 }
                 
                 // Exit condition 2: Thread timed out, queue is empty, and we can shrink
                 if (is_timeout && tasks_.empty() && active_threads_ > min_threads_) {
-                    is_shrinking = true;
                     active_threads_--;
-                    break;
+                    return;
                 }
 
                 // Handle spurious wakeups
@@ -157,21 +157,6 @@ private:
             task();
         }
         
-        // Thread is terminating, update counts and notify destructor if needed
-        {
-            if (is_shrinking) {
-                std::unique_lock<std::mutex> lock(queue_mutex_);
-                if (active_threads_ == 0) {
-                    shutdown_cv_.notify_all();
-                }
-            } else {
-                std::unique_lock<std::mutex> lock(queue_mutex_);
-                active_threads_--;
-                if (active_threads_ == 0) {
-                    shutdown_cv_.notify_all();
-                }
-            }
-        }
     }
 
     size_t min_threads_;
